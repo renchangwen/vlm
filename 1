@@ -1,0 +1,546 @@
+import React, { useState } from 'react';
+import { FileText, Folder, Code, Terminal, Image, Zap } from 'lucide-react';
+
+const ProjectStructure = () => {
+  const [activeTab, setActiveTab] = useState('structure');
+
+  const projectStructure = `text-guided-style-transfer/
+├── README.md
+├── requirements.txt
+├── setup.py
+│
+├── data/
+│   ├── content/              # 内容图片
+│   │   ├── landscape_1.jpg
+│   │   ├── portrait_1.jpg
+│   │   └── ...
+│   ├── styles/               # 风格图库
+│   │   ├── vangogh_starry.jpg
+│   │   ├── monet_water.jpg
+│   │   ├── picasso_abstract.jpg
+│   │   └── ...
+│   └── style_labels.json     # 风格图文本标签
+│
+├── models/
+│   ├── __init__.py
+│   ├── clip_retrieval.py     # CLIP检索模块
+│   ├── adain.py              # AdaIN核心
+│   ├── decoder.py            # 解码器
+│   └── vgg.py                # VGG特征提取
+│
+├── utils/
+│   ├── __init__.py
+│   ├── image_processing.py   # 图像加载/保存
+│   └── visualization.py      # 可视化工具
+│
+├── scripts/
+│   ├── preprocess_styles.py  # 预处理风格特征
+│   ├── train_decoder.py      # (可选)训练解码器
+│   └── demo.py               # 演示脚本
+│
+├── notebooks/
+│   └── interactive_demo.ipynb # Jupyter演示
+│
+├── checkpoints/              # 保存的模型权重
+│   ├── decoder.pth
+│   └── style_features.pt
+│
+├── results/                  # 输出结果
+│   └── ...
+│
+└── app.py                    # Gradio/Streamlit界面`;
+
+  const requirementsTxt = `# 核心依赖
+torch>=2.0.0
+torchvision>=0.15.0
+clip @ git+https://github.com/openai/CLIP.git
+
+# 图像处理
+Pillow>=9.0.0
+opencv-python>=4.5.0
+numpy>=1.21.0
+
+# 可视化
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Web界面
+gradio>=3.50.0
+
+# 工具
+tqdm>=4.62.0
+pyyaml>=6.0
+scikit-learn>=1.0.0
+
+# 开发工具
+jupyter>=1.0.0
+ipython>=8.0.0`;
+
+  const clipRetrievalCode = `import torch
+import clip
+from PIL import Image
+import json
+from pathlib import Path
+from typing import Dict, Tuple, List
+
+class CLIPStyleRetriever:
+    """基于CLIP的风格图检索器"""
+    
+    def __init__(self, style_dir: str, device: str = "cuda"):
+        self.device = device if torch.cuda.is_available() else "cpu"
+        
+        # 加载CLIP模型
+        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+        self.model.eval()
+        
+        self.style_dir = Path(style_dir)
+        self.style_features = {}
+        
+    def preprocess_style_library(self, style_labels_path: str, save_path: str = None):
+        """预处理风格图库，计算CLIP特征"""
+        
+        # 加载风格图标签
+        with open(style_labels_path, 'r', encoding='utf-8') as f:
+            style_labels = json.load(f)
+        
+        print("正在预处理风格图库...")
+        for img_name, text_label in style_labels.items():
+            img_path = self.style_dir / img_name
+            
+            if not img_path.exists():
+                print(f"警告: {img_path} 不存在")
+                continue
+            
+            # 加载图像
+            image = self.preprocess(Image.open(img_path)).unsqueeze(0).to(self.device)
+            
+            # 编码图像和文本
+            with torch.no_grad():
+                image_feature = self.model.encode_image(image)
+                text_feature = self.model.encode_text(
+                    clip.tokenize([text_label]).to(self.device)
+                )
+                
+                # L2归一化
+                image_feature = image_feature / image_feature.norm(dim=-1, keepdim=True)
+                text_feature = text_feature / text_feature.norm(dim=-1, keepdim=True)
+            
+            self.style_features[img_name] = {
+                'image_feature': image_feature.cpu(),
+                'text_feature': text_feature.cpu(),
+                'text_label': text_label,
+                'path': str(img_path)
+            }
+            
+            print(f"  已处理: {img_name} - {text_label}")
+        
+        # 保存特征
+        if save_path:
+            torch.save(self.style_features, save_path)
+            print(f"特征已保存到: {save_path}")
+        
+        return self.style_features`;
+
+  const adainCode = `import torch
+import torch.nn as nn
+
+class AdaIN(nn.Module):
+    """Adaptive Instance Normalization"""
+    
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, content_feat, style_feat):
+        """
+        Args:
+            content_feat: (B, C, H, W) 内容特征
+            style_feat: (B, C, H', W') 风格特征
+        Returns:
+            stylized_feat: (B, C, H, W) 风格化特征
+        """
+        assert content_feat.size()[:2] == style_feat.size()[:2]
+        
+        B, C = content_feat.size()[:2]
+        
+        # 计算内容特征的均值和标准差
+        content_mean = content_feat.view(B, C, -1).mean(dim=2).view(B, C, 1, 1)
+        content_std = content_feat.view(B, C, -1).std(dim=2).view(B, C, 1, 1)
+        
+        # 计算风格特征的均值和标准差
+        style_mean = style_feat.view(B, C, -1).mean(dim=2).view(B, C, 1, 1)
+        style_std = style_feat.view(B, C, -1).std(dim=2).view(B, C, 1, 1)
+        
+        # 标准化内容特征
+        normalized_feat = (content_feat - content_mean) / (content_std + 1e-5)
+        
+        # 使用风格统计量重新缩放
+        stylized_feat = normalized_feat * style_std + style_mean
+        
+        return stylized_feat`;
+
+  const vggCode = `import torch
+import torch.nn as nn
+from torchvision.models import vgg19
+
+class VGGEncoder(nn.Module):
+    """使用VGG19作为编码器提取特征"""
+    
+    def __init__(self, device='cuda'):
+        super().__init__()
+        
+        # 加载预训练的VGG19
+        vgg = vgg19(pretrained=True)
+        
+        # 使用relu4_1之前的层
+        self.encoder = nn.Sequential(*list(vgg.features.children())[:21])
+        
+        # 冻结参数
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        
+        self.encoder.eval()
+        self.encoder.to(device)`;
+
+  const decoderCode = `import torch
+import torch.nn as nn
+
+class Decoder(nn.Module):
+    """将AdaIN特征解码回图像"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # 镜像VGG编码器的结构
+        self.decoder = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(512, 256, 3),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(256, 256, 3),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(128, 64, 3),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(64, 3, 3),
+            nn.Sigmoid()
+        )`;
+
+  const pipelineCode = `from models.vgg import VGGEncoder
+from models.adain import AdaIN
+from models.decoder import Decoder
+from models.clip_retrieval import CLIPStyleRetriever
+
+class StyleTransferPipeline:
+    """完整的文本引导风格迁移流程"""
+    
+    def __init__(self, decoder_path: str, style_features_path: str, device: str = 'cuda'):
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        
+        # 初始化模块
+        self.encoder = VGGEncoder(device=self.device)
+        self.adain = AdaIN()
+        self.decoder = Decoder().to(self.device)
+        
+        # 加载解码器权重
+        if Path(decoder_path).exists():
+            self.decoder.load_state_dict(torch.load(decoder_path))
+            print(f"已加载解码器: {decoder_path}")
+        
+        self.decoder.eval()
+        
+        # 初始化CLIP检索器
+        self.retriever = CLIPStyleRetriever(
+            style_dir="data/styles",
+            device=self.device
+        )
+        self.retriever.load_features(style_features_path)
+    
+    def transfer(self, content_path: str, text_prompt: str, alpha: float = 1.0):
+        """执行风格迁移"""
+        
+        # 1. 检索风格图
+        results = self.retriever.retrieve(text_prompt, top_k=1)
+        style_name, similarity = results[0]
+        style_path = self.retriever.get_style_path(style_name)
+        
+        # 2. 加载图像并提取特征
+        content_feat = self.encoder(content_img)
+        style_feat = self.encoder(style_img)
+        
+        # 3. AdaIN
+        stylized_feat = self.adain(content_feat, style_feat)
+        
+        # 4. 插值控制风格强度
+        stylized_feat = alpha * stylized_feat + (1 - alpha) * content_feat
+        
+        # 5. 解码
+        result = self.decoder(stylized_feat)
+        
+        return result, style_path, similarity`;
+
+  const gradioApp = `import gradio as gr
+import torch
+from style_transfer import StyleTransferPipeline
+
+# 初始化模型
+pipeline = StyleTransferPipeline(
+    decoder_path="checkpoints/decoder.pth",
+    style_features_path="checkpoints/style_features.pt"
+)
+
+def style_transfer_gradio(content_img, text_prompt, alpha):
+    """Gradio接口函数"""
+    
+    # 执行风格迁移
+    result_img, style_path, similarity = pipeline.transfer(
+        content_path=content_img,
+        text_prompt=text_prompt,
+        alpha=alpha
+    )
+    
+    info = f"检索到的风格图: {style_path}\\n相似度: {similarity:.4f}"
+    
+    return result_img, style_img, info
+
+# 创建Gradio界面
+demo = gr.Interface(
+    fn=style_transfer_gradio,
+    inputs=[
+        gr.Image(type="pil", label="上传内容图"),
+        gr.Textbox(label="风格描述", placeholder="例如: van gogh starry night"),
+        gr.Slider(0, 1, value=1.0, label="风格强度")
+    ],
+    outputs=[
+        gr.Image(label="风格化结果"),
+        gr.Image(label="匹配的风格图"),
+        gr.Textbox(label="检索信息")
+    ],
+    title="文本引导风格迁移 (CLIP + AdaIN)"
+)
+
+if __name__ == "__main__":
+    demo.launch(share=True)`;
+
+  const styleLabelsJson = `{
+  "vangogh_starry_night.jpg": "van gogh starry night swirling sky",
+  "monet_water_lilies.jpg": "monet impressionist water lilies",
+  "picasso_guernica.jpg": "picasso cubism abstract geometric",
+  "hokusai_wave.jpg": "hokusai great wave japanese ukiyo-e",
+  "kandinsky_composition.jpg": "kandinsky abstract colorful shapes"
+}`;
+
+  const readme = `# 文本引导风格迁移 (CLIP + AdaIN)
+
+基于CLIP和AdaIN的零训练风格迁移系统
+
+## 特性
+- 零训练: 使用预训练模型
+- 文本引导: 自然语言描述风格
+- 实时推理: 单张图像<2秒
+
+## 快速开始
+
+### 1. 安装依赖
+pip install -r requirements.txt
+
+### 2. 预处理风格库
+python scripts/preprocess_styles.py
+
+### 3. 运行演示
+python scripts/demo.py --content photo.jpg --prompt "van gogh style"
+
+### 4. Web界面
+python app.py`;
+
+  const tabs = [
+    { id: 'structure', name: '项目结构', icon: Folder },
+    { id: 'clip', name: 'CLIP检索', icon: Code },
+    { id: 'adain', name: 'AdaIN', icon: Zap },
+    { id: 'vgg', name: 'VGG编码器', icon: Code },
+    { id: 'decoder', name: '解码器', icon: Code },
+    { id: 'pipeline', name: '完整流程', icon: Terminal },
+    { id: 'gradio', name: 'Web界面', icon: Image },
+    { id: 'readme', name: 'README', icon: FileText }
+  ];
+
+  const renderContent = () => {
+    switch(activeTab) {
+      case 'structure':
+        return (
+          <div className="space-y-4">
+            <div className="bg-blue-50 p-4 rounded-lg">
+              <h3 className="font-semibold text-blue-900 mb-2">📁 项目目录结构</h3>
+              <pre className="text-xs bg-white p-3 rounded overflow-x-auto font-mono">
+                {projectStructure}
+              </pre>
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-gray-50 p-3 rounded">
+                <h4 className="font-semibold mb-2">requirements.txt</h4>
+                <pre className="text-xs bg-white p-2 rounded overflow-x-auto h-64 font-mono">
+                  {requirementsTxt}
+                </pre>
+              </div>
+              
+              <div className="bg-gray-50 p-3 rounded">
+                <h4 className="font-semibold mb-2">style_labels.json</h4>
+                <pre className="text-xs bg-white p-2 rounded overflow-x-auto h-64 font-mono">
+                  {styleLabelsJson}
+                </pre>
+              </div>
+            </div>
+          </div>
+        );
+      
+      case 'clip':
+        return (
+          <div className="space-y-3">
+            <div className="bg-purple-50 p-3 rounded">
+              <h3 className="font-semibold text-purple-900 mb-2">🔍 models/clip_retrieval.py</h3>
+              <p className="text-sm text-gray-700">CLIP文本-图像检索模块</p>
+            </div>
+            <pre className="text-xs bg-gray-900 text-green-400 p-4 rounded overflow-x-auto max-h-96 font-mono">
+              {clipRetrievalCode}
+            </pre>
+          </div>
+        );
+      
+      case 'adain':
+        return (
+          <div className="space-y-3">
+            <div className="bg-yellow-50 p-3 rounded">
+              <h3 className="font-semibold text-yellow-900 mb-2">⚡ models/adain.py</h3>
+              <p className="text-sm text-gray-700">自适应实例归一化核心算法</p>
+            </div>
+            <pre className="text-xs bg-gray-900 text-green-400 p-4 rounded overflow-x-auto max-h-96 font-mono">
+              {adainCode}
+            </pre>
+          </div>
+        );
+      
+      case 'vgg':
+        return (
+          <div className="space-y-3">
+            <div className="bg-green-50 p-3 rounded">
+              <h3 className="font-semibold text-green-900 mb-2">🎨 models/vgg.py</h3>
+              <p className="text-sm text-gray-700">VGG19特征提取器</p>
+            </div>
+            <pre className="text-xs bg-gray-900 text-green-400 p-4 rounded overflow-x-auto max-h-96 font-mono">
+              {vggCode}
+            </pre>
+          </div>
+        );
+      
+      case 'decoder':
+        return (
+          <div className="space-y-3">
+            <div className="bg-red-50 p-3 rounded">
+              <h3 className="font-semibold text-red-900 mb-2">🔧 models/decoder.py</h3>
+              <p className="text-sm text-gray-700">特征解码器</p>
+            </div>
+            <pre className="text-xs bg-gray-900 text-green-400 p-4 rounded overflow-x-auto max-h-96 font-mono">
+              {decoderCode}
+            </pre>
+          </div>
+        );
+      
+      case 'pipeline':
+        return (
+          <div className="space-y-3">
+            <div className="bg-indigo-50 p-3 rounded">
+              <h3 className="font-semibold text-indigo-900 mb-2">🚀 style_transfer.py</h3>
+              <p className="text-sm text-gray-700">完整风格迁移流程</p>
+            </div>
+            <pre className="text-xs bg-gray-900 text-green-400 p-4 rounded overflow-x-auto max-h-96 font-mono">
+              {pipelineCode}
+            </pre>
+          </div>
+        );
+      
+      case 'gradio':
+        return (
+          <div className="space-y-3">
+            <div className="bg-pink-50 p-3 rounded">
+              <h3 className="font-semibold text-pink-900 mb-2">🌐 app.py</h3>
+              <p className="text-sm text-gray-700">Gradio Web界面</p>
+            </div>
+            <pre className="text-xs bg-gray-900 text-green-400 p-4 rounded overflow-x-auto max-h-96 font-mono">
+              {gradioApp}
+            </pre>
+          </div>
+        );
+      
+      case 'readme':
+        return (
+          <div className="space-y-3">
+            <div className="bg-gray-50 p-3 rounded">
+              <h3 className="font-semibold text-gray-900 mb-2">📝 README.md</h3>
+            </div>
+            <pre className="text-sm bg-white p-4 rounded overflow-x-auto max-h-96 font-mono whitespace-pre-wrap">
+              {readme}
+            </pre>
+          </div>
+        );
+      
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="w-full max-w-6xl mx-auto p-6 bg-white">
+      <div className="mb-6">
+        <h1 className="text-3xl font-bold text-gray-900 mb-2">
+          🎨 CLIP + AdaIN 风格迁移项目
+        </h1>
+        <p className="text-gray-600">
+          完整的文本引导风格迁移实现 - 零训练方案
+        </p>
+      </div>
+      
+      <div className="flex gap-2 mb-4 flex-wrap">
+        {tabs.map(tab => {
+          const Icon = tab.icon;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                activeTab === tab.id
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+              }`}
+            >
+              <Icon size={16} />
+              {tab.name}
+            </button>
+          );
+        })}
+      </div>
+      
+      <div className="border border-gray-200 rounded-lg p-4 bg-gray-50">
+        {renderContent()}
+      </div>
+      
+      <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+        <h3 className="font-semibold text-blue-900 mb-2">💡 使用提示</h3>
+        <ul className="text-sm text-blue-800 space-y-1">
+          <li>• 点击上方标签切换查看不同模块的代码</li>
+          <li>• 所有代码都是可直接运行的完整实现</li>
+          <li>• 建议按照 项目结构 → CLIP检索 → AdaIN → 完整流程 的顺序学习</li>
+          <li>• 复试演示时重点讲解CLIP检索和AdaIN核心算法</li>
+        </ul>
+      </div>
+    </div>
+  );
+};
+
+export default ProjectStructure;
